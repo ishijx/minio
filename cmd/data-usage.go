@@ -22,20 +22,26 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
+	"github.com/minio/minio/cmd/config"
 	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/env"
 	"github.com/minio/minio/pkg/hash"
 )
 
 const (
 	dataUsageObjName       = "data-usage"
 	dataUsageCrawlInterval = 12 * time.Hour
+	dataUsageCrawlConf     = "MINIO_DISK_USAGE_CRAWL"
 )
 
 func initDataUsageStats() {
+	dataUsageEnabled, err := config.ParseBool(env.Get(dataUsageCrawlConf, config.EnableOn))
+	if err == nil && !dataUsageEnabled {
+		return
+	}
 	go runDataUsageInfoUpdateRoutine()
 }
 
@@ -68,21 +74,23 @@ func timeToCrawl(ctx context.Context, objAPI ObjectLayer) time.Duration {
 	if dataUsageInfo.LastUpdate.IsZero() {
 		return 1 * time.Second
 	}
-	waitDuration := dataUsageInfo.LastUpdate.Sub(UTCNow())
-	if waitDuration > dataUsageCrawlInterval {
+	timeSinceLastUpdate := UTCNow().Sub(dataUsageInfo.LastUpdate)
+	if timeSinceLastUpdate > dataUsageCrawlInterval {
 		// Waited long enough start crawl in a 1 second
 		return 1 * time.Second
 	}
 	// No crawling needed, ask the routine to wait until
 	// the daily interval 12hrs - delta between last update
 	// with current time.
-	return dataUsageCrawlInterval - waitDuration
+	return dataUsageCrawlInterval - timeSinceLastUpdate
 }
+
+var dataUsageLockTimeout = lifecycleLockTimeout
 
 func runDataUsageInfo(ctx context.Context, objAPI ObjectLayer, endCh <-chan struct{}) {
 	locker := objAPI.NewNSLock(ctx, minioMetaBucket, "leader-data-usage-info")
 	for {
-		err := locker.GetLock(newDynamicTimeout(time.Millisecond, time.Millisecond))
+		err := locker.GetLock(dataUsageLockTimeout)
 		if err != nil {
 			time.Sleep(5 * time.Minute)
 			continue
@@ -158,10 +166,7 @@ func updateUsage(basePath string, doneCh <-chan struct{}, waitForLowActiveIO fun
 		ObjectsSizesHistogram: make(map[string]uint64),
 	}
 
-	numWorkers := 4
-	var mutex sync.Mutex // Mutex to update dataUsageInfo
-
-	fastWalk(basePath, numWorkers, doneCh, func(path string, typ os.FileMode) error {
+	fastWalk(basePath, 1, doneCh, func(path string, typ os.FileMode) error {
 		// Wait for I/O to go down.
 		waitForLowActiveIO()
 
@@ -175,15 +180,10 @@ func updateUsage(basePath string, doneCh <-chan struct{}, waitForLowActiveIO fun
 		}
 
 		if entry == "" && typ&os.ModeDir != 0 {
-			mutex.Lock()
 			dataUsageInfo.BucketsCount++
 			dataUsageInfo.BucketsSizes[bucket] = 0
-			mutex.Unlock()
 			return nil
 		}
-
-		mutex.Lock()
-		defer mutex.Unlock()
 
 		if typ&os.ModeDir != 0 {
 			return nil

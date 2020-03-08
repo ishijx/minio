@@ -368,11 +368,11 @@ func (s *posix) CrawlAndGetDataUsage(endCh <-chan struct{}) (DataUsageInfo, erro
 // DiskInfo is an extended type which returns current
 // disk usage per path.
 type DiskInfo struct {
-	Total        uint64
-	Free         uint64
-	Used         uint64
-	RootDisk     bool
-	RelativePath string
+	Total     uint64
+	Free      uint64
+	Used      uint64
+	RootDisk  bool
+	MountPath string
 }
 
 // DiskInfo provides current information about disk space usage,
@@ -398,17 +398,12 @@ func (s *posix) DiskInfo() (info DiskInfo, err error) {
 		return info, err
 	}
 
-	localPeer := ""
-	if globalIsDistXL {
-		localPeer = GetLocalPeer(globalEndpoints)
-	}
-
 	return DiskInfo{
-		Total:        di.Total,
-		Free:         di.Free,
-		Used:         used,
-		RootDisk:     rootDisk,
-		RelativePath: localPeer + s.diskPath,
+		Total:     di.Total,
+		Free:      di.Free,
+		Used:      used,
+		RootDisk:  rootDisk,
+		MountPath: s.diskPath,
 	}, nil
 }
 
@@ -648,7 +643,7 @@ func (s *posix) DeleteVol(volume string) (err error) {
 // Walk - is a sorted walker which returns file entries in lexically
 // sorted order, additionally along with metadata about each of those entries.
 func (s *posix) Walk(volume, dirPath, marker string, recursive bool, leafFile string,
-	readMetadataFn readMetadataFunc, endWalkCh chan struct{}) (ch chan FileInfo, err error) {
+	readMetadataFn readMetadataFunc, endWalkCh <-chan struct{}) (ch chan FileInfo, err error) {
 
 	atomic.AddInt32(&s.activeIOCount, 1)
 	defer func() {
@@ -1345,9 +1340,40 @@ func (s *posix) DeleteFile(volume, path string) (err error) {
 }
 
 func (s *posix) DeleteFileBulk(volume string, paths []string) (errs []error, err error) {
+	atomic.AddInt32(&s.activeIOCount, 1)
+	defer func() {
+		atomic.AddInt32(&s.activeIOCount, -1)
+	}()
+
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return nil, err
+	}
+
+	// Stat a volume entry.
+	_, err = os.Stat(volumeDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, errVolumeNotFound
+		} else if os.IsPermission(err) {
+			return nil, errVolumeAccessDenied
+		} else if isSysErrIO(err) {
+			return nil, errFaultyDisk
+		}
+		return nil, err
+	}
+
 	errs = make([]error, len(paths))
+	// Following code is needed so that we retain SlashSeparator
+	// suffix if any in path argument.
 	for idx, path := range paths {
-		errs[idx] = s.DeleteFile(volume, path)
+		filePath := pathJoin(volumeDir, path)
+		errs[idx] = checkPathLength(filePath)
+		if errs[idx] != nil {
+			continue
+		}
+		// Delete file and delete parent directory as well if its empty.
+		errs[idx] = deleteFile(volumeDir, filePath)
 	}
 	return
 }
